@@ -10,6 +10,12 @@ start:
     mov sp, 0x7C00
     sti
 
+    mov ax, 0x1202
+    mov bx, 0x0030
+    int 0x10
+    mov ax, 0x0003
+    int 0x10
+
     mov [BOOT_DRIVE], dl
 
     mov ah, 0x42

@@ -24,7 +24,7 @@ GitFreedom.img: boot.bin
 	@echo "=== GitFreedom OS Compiled Successfully ==="
 
 run: GitFreedom.img
-	qemu-system-i386 -hda GitFreedom.img -m 16M
+	qemu-system-i386 -hda GitFreedom.img -m 16M -display cocoa,zoom-to-fit=on
 
 clean:
 	rm -f *.o *.bin *.img

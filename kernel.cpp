@@ -2,15 +2,21 @@ typedef unsigned char  u8;
 typedef unsigned short u16;
 typedef unsigned int   u32;
 
+extern "C" void* memset(void* s, int c, unsigned long n) {
+    u8* p = (u8*)s;
+    while (n--) *p++ = (u8)c;
+    return s;
+}
+
 #define VGA ((u16*)0xB8000)
 #define W 80
-#define H 25
+#define H 50
 
 u16 TERM_BG = 0x0000;
 u16 TERM_FG = 0x0F00;
 u16 TERM_ROOT = 0x0F00;
-u16 TERM_ERR = 0x0F00;
-u16 TERM_SYS = 0x0F00;
+u16 TERM_ERR = 0x0C00;
+u16 TERM_SYS = 0x0B00;
 
 static inline u8  inb(u16 p) { u8 v; __asm__ volatile("inb %1,%0":"=a"(v):"dN"(p)); return v; }
 static inline void outb(u16 p, u8 v) { __asm__ volatile("outb %0,%1"::"a"(v),"dN"(p)); }
@@ -18,7 +24,7 @@ static inline u16 inw(u16 p) { u16 v; __asm__ volatile("inw %1,%0":"=a"(v):"dN"(
 static inline void outw(u16 p, u16 v) { __asm__ volatile("outw %0,%1"::"a"(v),"dN"(p)); }
 
 static void cls() { for(int i=0; i<W*H; i++) VGA[i] = TERM_BG | ' '; }
-static void putc_at(int x, int y, char c, u16 col) { if(x<W && y<H) VGA[y*W+x]=TERM_BG|col|(u8)c; }
+static void putc_at(int x, int y, char c, u16 col) { if(x<W && y<H) VGA[y*W+x]=(TERM_BG<<4)|col|(u8)c; }
 static void puts_at(int x, int y, const char* s, u16 col) { for(; *s; s++, x++) putc_at(x, y, *s, col); }
 static void fill_row(int y, u16 col) { for(int x=0; x<W; x++) VGA[y*W+x]=col|' '; }
 
@@ -32,14 +38,18 @@ static int starts(const char* s, const char* p) { while(*p) if(*s++ != *p++) ret
 static void sint(char* b, int n) {
     if(!n) { b[0]='0'; b[1]=0; return; }
     char t[12]; int i=0;
+    int neg = n < 0; if(neg) n = -n;
     while(n>0) { t[i++]='0'+(n%10); n/=10; }
-    int j=0; while(i>0) b[j++]=t[--i]; b[j]=0;
+    int j=0; if(neg) b[j++]='-';
+    while(i>0) b[j++]=t[--i]; b[j]=0;
 }
 
 static int atoi(const char* s) {
+    int neg = 0;
+    if(*s == '-') { neg = 1; s++; }
     int res = 0;
     while(*s >= '0' && *s <= '9') { res = res * 10 + (*s - '0'); s++; }
-    return res;
+    return neg ? -res : res;
 }
 
 static void delay(int loops) {
@@ -67,10 +77,11 @@ static void ata_read_sector(u32 lba, u16* buf) {
 static void ata_write_sector(u32 lba, const u16* buf) {
     outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
     outb(0x1F2, 1); outb(0x1F3, (u8)lba); outb(0x1F4, (u8)(lba >> 8)); outb(0x1F5, (u8)(lba >> 16));
-    outb(0x1F7, 0x30); 
+    outb(0x1F7, 0x30);
     if(!ata_wait_drq()) return;
     for(int i=0; i<256; i++) outw(0x1F0, buf[i]);
-    outb(0x1F7, 0xE7); 
+    outb(0x1F7, 0xE7);
+    for(int i=0; i<100000; i++) { if(!(inb(0x1F7) & 0x80)) break; }
 }
 
 #define NFILES 32
@@ -80,10 +91,25 @@ static File fs[NFILES];
 static int fscnt = 0;
 static int shell_row;
 static u32 uptime_ticks = 0;
+static bool shift_pressed = false;
+
+#define VIM_MAXLINES 64
+#define VIM_COLS     78
+
+static char vim_lines[VIM_MAXLINES][VIM_COLS];
+static char vim_yank[VIM_COLS];
+static int  vim_nlines;
+static int  vim_cx, vim_cy;
+static int  vim_top;
+static int  vim_mode;
+static bool vim_modified;
+static char vim_cmd[80];
+static char vim_pending;
 
 static void disk_sync_write() {
     u8* ptr = (u8*)fs;
-    for (int s = 0; s < 100; s++) { 
+    const int SECTORS = (sizeof(fs) + 511) / 512;
+    for (int s = 0; s < SECTORS; s++) {
         u16 sector_buf[256];
         for (int i = 0; i < 512; i++) ((u8*)sector_buf)[i] = ptr[s * 512 + i];
         ata_write_sector(100 + s, sector_buf);
@@ -92,7 +118,8 @@ static void disk_sync_write() {
 
 static void disk_sync_read() {
     u8* ptr = (u8*)fs;
-    for (int s = 0; s < 100; s++) {
+    const int SECTORS = (sizeof(fs) + 511) / 512;
+    for (int s = 0; s < SECTORS; s++) {
         u16 sector_buf[256];
         ata_read_sector(100 + s, sector_buf);
         for (int i = 0; i < 512; i++) ptr[s * 512 + i] = ((u8*)sector_buf)[i];
@@ -114,24 +141,187 @@ static File* fs_new(const char* n, int sys) {
     return 0;
 }
 
-static File* fs_open(const char* n) { 
-    File* f = fs_find(n); 
-    return f ? f : fs_new(n, 0); 
+static File* fs_open(const char* n) {
+    File* f = fs_find(n);
+    return f ? f : fs_new(n, 0);
 }
 
-static u8 kbd_scan() {
-    while(!(inb(0x64) & 1)) uptime_ticks++; 
+static void vim_load(File* f) {
+    for(int i = 0; i < VIM_MAXLINES; i++) vim_lines[i][0] = 0;
+    vim_nlines = 0; vim_cx = 0; vim_cy = 0; vim_top = 0;
+    vim_mode = 0; vim_modified = false; vim_pending = 0;
+    vim_cmd[0] = 0; vim_yank[0] = 0;
+
+    if(f->sz == 0) { vim_nlines = 1; return; }
+
+    char* p = f->data;
+    int row = 0;
+    while(*p && row < VIM_MAXLINES) {
+        int col = 0;
+        while(*p && *p != '\n' && col < VIM_COLS - 1) vim_lines[row][col++] = *p++;
+        vim_lines[row][col] = 0;
+        if(*p == '\n') p++;
+        row++;
+    }
+    vim_nlines = row > 0 ? row : 1;
+}
+
+static void vim_save(File* f) {
+    char* p = f->data;
+    for(int i = 0; i < vim_nlines; i++) {
+        char* line = vim_lines[i];
+        while(*line) *p++ = *line++;
+        if(i < vim_nlines - 1) *p++ = '\n';
+    }
+    *p = 0;
+    f->sz = (int)(p - f->data);
+    disk_sync_write();
+    vim_modified = false;
+}
+
+static void vim_render(File* f) {
+    // Row 0: header
+    fill_row(0, 0xF000);
+    char hdr[82] = "";
+    if(vim_mode == 0)      scat(hdr, "[NORMAL]  ");
+    else if(vim_mode == 1) scat(hdr, "[INSERT]  ");
+    else                   scat(hdr, "[COMMAND] ");
+    scat(hdr, f->name);
+    if(vim_modified) scat(hdr, "  [Modified]");
+    puts_at(1, 0, hdr, 0xF000);
+
+    // Rows 1..H-2: file content
+    int view_rows = H - 2;
+    for(int i = 0; i < view_rows; i++) {
+        int file_row = vim_top + i;
+        int screen_row = i + 1;
+        for(int x = 0; x < W; x++) VGA[screen_row * W + x] = TERM_BG | ' ';
+        if(file_row < vim_nlines) {
+            char* line = vim_lines[file_row];
+            int len = slen(line);
+            for(int x = 0; x < len && x < W; x++) {
+                u8 ch = (u8)line[x];
+                if(file_row == vim_cy && x == vim_cx && vim_mode != 2)
+                    VGA[screen_row * W + x] = 0xF000 | ch;
+                else
+                    VGA[screen_row * W + x] = TERM_FG | ch;
+            }
+            if(file_row == vim_cy && vim_cx >= len && vim_mode != 2)
+                VGA[screen_row * W + (vim_cx < W ? vim_cx : W-1)] = 0xF000 | ' ';
+        } else {
+            VGA[screen_row * W] = TERM_FG | '~';
+        }
+    }
+
+    // Row H-1: status bar
+    fill_row(H-1, 0xF000);
+    if(vim_mode == 2) {
+        char cmdline[82] = ":";
+        scat(cmdline, vim_cmd);
+        puts_at(0, H-1, cmdline, 0xF000);
+    } else {
+        char pos[48] = "Ln "; char n[12];
+        sint(n, vim_cy + 1); scat(pos, n);
+        scat(pos, ", Col "); sint(n, vim_cx + 1); scat(pos, n);
+        puts_at(1, H-1, pos, 0xF000);
+    }
+}
+
+static void vim_x() {
+    char* line = vim_lines[vim_cy];
+    int len = slen(line);
+    if(vim_cx >= len) return;
+    for(int i = vim_cx; i < len; i++) line[i] = line[i+1];
+    int newlen = slen(line);
+    if(vim_cx > 0 && vim_cx >= newlen) vim_cx = newlen > 0 ? newlen - 1 : 0;
+    vim_modified = true;
+}
+
+static void vim_dd() {
+    sncpy(vim_yank, vim_lines[vim_cy], VIM_COLS);
+    if(vim_nlines > 1) {
+        for(int i = vim_cy; i < vim_nlines - 1; i++)
+            sncpy(vim_lines[i], vim_lines[i+1], VIM_COLS);
+        vim_lines[vim_nlines-1][0] = 0;
+        vim_nlines--;
+        if(vim_cy >= vim_nlines) vim_cy = vim_nlines - 1;
+    } else {
+        vim_lines[0][0] = 0;
+    }
+    vim_cx = 0;
+    vim_modified = true;
+}
+
+static void vim_yy() {
+    sncpy(vim_yank, vim_lines[vim_cy], VIM_COLS);
+}
+
+static void vim_p() {
+    if(vim_nlines >= VIM_MAXLINES) return;
+    for(int i = vim_nlines; i > vim_cy + 1; i--)
+        sncpy(vim_lines[i], vim_lines[i-1], VIM_COLS);
+    sncpy(vim_lines[vim_cy + 1], vim_yank, VIM_COLS);
+    vim_nlines++;
+    vim_cy++;
+    vim_cx = 0;
+    vim_modified = true;
+}
+
+static void vim_o() {
+    if(vim_nlines >= VIM_MAXLINES) return;
+    for(int i = vim_nlines; i > vim_cy + 1; i--)
+        sncpy(vim_lines[i], vim_lines[i-1], VIM_COLS);
+    vim_lines[vim_cy + 1][0] = 0;
+    vim_nlines++;
+    vim_cy++;
+    vim_cx = 0;
+    vim_mode = 1;
+    vim_modified = true;
+}
+
+#define KEY_UP    0x80
+#define KEY_DOWN  0x81
+#define KEY_LEFT  0x82
+#define KEY_RIGHT 0x83
+
+static u8 kbd_scan_raw() {
+    while(!(inb(0x64) & 1)) uptime_ticks++;
     return inb(0x60);
+}
+
+static u8 get_key() {
+    while(1) {
+        u8 sc = kbd_scan_raw();
+        if(sc == 0xE0) {
+            u8 ext = kbd_scan_raw();
+            if(ext == 0x48) return KEY_UP;
+            if(ext == 0x50) return KEY_DOWN;
+            if(ext == 0x4B) return KEY_LEFT;
+            if(ext == 0x4D) return KEY_RIGHT;
+            continue;
+        }
+        if(sc == 0x2A || sc == 0x36) { shift_pressed = true;  continue; }
+        if(sc == 0xAA || sc == 0xB6) { shift_pressed = false; continue; }
+        if(sc >= 0x80) continue;
+        return sc;
+    }
 }
 
 static char sc2ch(u8 sc) {
     static const char t[128] = {
-        0,  0, '1','2','3','4','5','6','7','8','9','0','-','=', 0,  
-        0, 'q','w','e','r','t','y','u','i','o','p','[',']','\n',    
-        0, 'a','s','d','f','g','h','j','k','l',';','\'','`',  0,    
-       '\\','z','x','c','v','b','n','m',',','.','/', 0, '*', 0, ' ' 
+        0,  0, '1','2','3','4','5','6','7','8','9','0','-','=', 0,
+        0, 'q','w','e','r','t','y','u','i','o','p','[',']','\n',
+        0, 'a','s','d','f','g','h','j','k','l',';','\'','`',  0,
+       '\\','z','x','c','v','b','n','m',',','.','/', 0, '*', 0, ' '
     };
-    return sc < 128 ? t[sc] : 0;
+    static const char ts[128] = {
+        0,  0, '!','@','#','$','%','^','&','*','(',')','_','+', 0,
+        0, 'Q','W','E','R','T','Y','U','I','O','P','{','}','\n',
+        0, 'A','S','D','F','G','H','J','K','L',':','"','~',  0,
+       '|','Z','X','C','V','B','N','M','<','>','?', 0, '*', 0, ' '
+    };
+    if(sc >= 128) return 0;
+    return shift_pressed ? ts[sc] : t[sc];
 }
 
 static int readline(char* buf, int max, int row, u16 prompt_len, u16 col) {
@@ -139,7 +329,7 @@ static int readline(char* buf, int max, int row, u16 prompt_len, u16 col) {
     while(1){
         puts_at(prompt_len, row, buf, col);
         putc_at(prompt_len+i, row, '_', 0x0F00); 
-        u8 sc=kbd_scan();
+        u8 sc=get_key();
         if(sc==0x1C) { buf[i]=0; putc_at(prompt_len+i, row, ' ', col); return i; } 
         if(sc==0x0E && i>0) { 
             buf[--i]=0; 
@@ -153,27 +343,186 @@ static int readline(char* buf, int max, int row, u16 prompt_len, u16 col) {
     }
 }
 
+static void vim_editor(File* f) {
+    vim_load(f);
+    vim_render(f);
+
+    while(1) {
+        u8 sc = get_key();
+        bool quit = false;
+
+        if(vim_mode == 0) {
+            // NORMAL mode
+            char nch = sc2ch(sc);
+            if(nch == 'h' || sc == KEY_LEFT)  { if(vim_cx > 0) vim_cx--; vim_pending = 0; }
+            else if(nch == 'l' || sc == KEY_RIGHT) { if(vim_cx < slen(vim_lines[vim_cy])) vim_cx++; vim_pending = 0; }
+            else if(nch == 'k' || sc == KEY_UP)    { if(vim_cy > 0) vim_cy--; vim_pending = 0; }
+            else if(nch == 'j' || sc == KEY_DOWN)  { if(vim_cy < vim_nlines-1) vim_cy++; vim_pending = 0; }
+            else if(nch == 'i') { vim_mode = 1; vim_pending = 0; }
+            else if(nch == 'a') {
+                int len = slen(vim_lines[vim_cy]);
+                if(vim_cx < len) vim_cx++;
+                vim_mode = 1; vim_pending = 0;
+            }
+            else if(nch == 'o') { vim_o(); vim_pending = 0; }
+            else if(nch == 'x') { vim_x(); vim_pending = 0; }
+            else if(nch == 'p') { vim_p(); vim_pending = 0; }
+            else if(nch == ':') { vim_mode = 2; vim_cmd[0] = 0; vim_pending = 0; }
+            else if(nch == 'd' || nch == 'y') {
+                char ch = nch;
+                if(vim_pending == ch) {
+                    if(ch == 'd') vim_dd();
+                    else          vim_yy();
+                    vim_pending = 0;
+                } else {
+                    vim_pending = ch;
+                }
+            }
+            else { vim_pending = 0; }
+
+        } else if(vim_mode == 1) {
+            // INSERT mode
+            if(sc == 0x01) {
+                // Esc → NORMAL
+                vim_mode = 0;
+                if(vim_cx > 0) vim_cx--;
+            }
+            else if(sc == 0x1C) {
+                // Enter → split line at cursor
+                char* cur = vim_lines[vim_cy];
+                char right[VIM_COLS] = "";
+                sncpy(right, cur + vim_cx, VIM_COLS);
+                cur[vim_cx] = 0;
+                if(vim_nlines < VIM_MAXLINES) {
+                    for(int i = vim_nlines; i > vim_cy + 1; i--)
+                        sncpy(vim_lines[i], vim_lines[i-1], VIM_COLS);
+                    sncpy(vim_lines[vim_cy + 1], right, VIM_COLS);
+                    vim_nlines++;
+                    vim_cy++;
+                    vim_cx = 0;
+                    vim_modified = true;
+                }
+            }
+            else if(sc == 0x0E) {
+                // Backspace
+                if(vim_cx > 0) {
+                    char* line = vim_lines[vim_cy];
+                    int len = slen(line);
+                    for(int i = vim_cx - 1; i < len; i++) line[i] = line[i+1];
+                    vim_cx--;
+                    vim_modified = true;
+                } else if(vim_cy > 0) {
+                    // join current line onto previous
+                    char* prev = vim_lines[vim_cy - 1];
+                    int prev_len = slen(prev);
+                    char* cur = vim_lines[vim_cy];
+                    if(prev_len + slen(cur) < VIM_COLS - 1) {
+                        scat(prev, cur);
+                        for(int i = vim_cy; i < vim_nlines - 1; i++)
+                            sncpy(vim_lines[i], vim_lines[i+1], VIM_COLS);
+                        vim_lines[vim_nlines-1][0] = 0;
+                        vim_nlines--;
+                        vim_cy--;
+                        vim_cx = prev_len;
+                        vim_modified = true;
+                    }
+                }
+            }
+            else if(sc == KEY_UP)    { if(vim_cy > 0) vim_cy--; }
+            else if(sc == KEY_DOWN)  { if(vim_cy < vim_nlines-1) vim_cy++; }
+            else if(sc == KEY_LEFT)  { if(vim_cx > 0) vim_cx--; }
+            else if(sc == KEY_RIGHT) { if(vim_cx < slen(vim_lines[vim_cy])) vim_cx++; }
+            else {
+                char c = sc2ch(sc);
+                if(c) {
+                    char* line = vim_lines[vim_cy];
+                    int len = slen(line);
+                    if(len < VIM_COLS - 1) {
+                        for(int i = len; i >= vim_cx; i--) line[i+1] = line[i];
+                        line[vim_cx] = c;
+                        vim_cx++;
+                        vim_modified = true;
+                    }
+                }
+            }
+
+        } else {
+            // COMMAND mode
+            if(sc == 0x01) {
+                // Esc → cancel command
+                vim_mode = 0; vim_cmd[0] = 0;
+            }
+            else if(sc == 0x1C) {
+                // Enter → execute command
+                if(!scmp(vim_cmd, "w"))   { vim_save(f); }
+                else if(!scmp(vim_cmd, "q"))  {
+                    if(!vim_modified) quit = true;
+                    else { fill_row(H-1, 0xF000); puts_at(0, H-1, "E: unsaved changes -- use :q! to force", 0x0C00); }
+                }
+                else if(!scmp(vim_cmd, "wq")) { vim_save(f); quit = true; }
+                else if(!scmp(vim_cmd, "q!")) { quit = true; }
+                else {
+                    fill_row(H-1, 0xF000);
+                    char err[82] = "E: unknown command: "; scat(err, vim_cmd);
+                    puts_at(0, H-1, err, 0x0C00);
+                }
+                if(!quit) { vim_mode = 0; vim_cmd[0] = 0; }
+            }
+            else if(sc == 0x0E) {
+                // Backspace in command line
+                int len = slen(vim_cmd);
+                if(len > 0) vim_cmd[len-1] = 0;
+            }
+            else {
+                char c = sc2ch(sc);
+                if(c) {
+                    int len = slen(vim_cmd);
+                    if(len < 78) { vim_cmd[len] = c; vim_cmd[len+1] = 0; }
+                }
+            }
+        }
+
+        if(quit) break;
+
+        // Scroll adjustment
+        if(vim_cy < vim_top) vim_top = vim_cy;
+        if(vim_cy >= vim_top + (H - 2)) vim_top = vim_cy - (H - 3);
+
+        // Clamp cursor column — always clamp to line length, then apply NORMAL-mode stricter clamp
+        int line_len = slen(vim_lines[vim_cy]);
+        if(vim_cx > line_len) vim_cx = line_len;
+        if(vim_mode == 0 && vim_cx >= line_len)
+            vim_cx = line_len > 0 ? line_len - 1 : 0;
+
+        vim_render(f);
+    }
+
+    cls(); shell_row = 1;
+}
+
 static void text_editor(File* f) {
     cls(); fill_row(0, 0xF000); fill_row(H-1, 0xF000);
     puts_at(2, 0, " GitOS Code Editor v1.0 ", 0xF000);
     puts_at(2, H-1, "^ESC Save & Exit   |   File: ", 0xF000); puts_at(31, H-1, f->name, 0xF000);
-    
-    char buf[1024]="";
-    if(f->sz > 0) sncpy(buf, f->data, 1024);
-    
+
+    char buf[2048]="";
+    if(f->sz > 0) sncpy(buf, f->data, 2048);
+
     int cursor_y = 2;
     char line_buf[64]="";
     char* ptr = buf;
-    
-    while(cursor_y < H-2) {
-        if(readline(line_buf, 62, cursor_y, 2, 0x0F00) < 0) break; 
+
+    int max_lines = H - 4;
+    while(cursor_y < 2 + max_lines) {
+        if(ptr - buf >= FSIZE - 64) break;
+        if(readline(line_buf, 62, cursor_y, 2, 0x0F00) < 0) break;
         scpy(ptr, line_buf);
         ptr += slen(line_buf);
         *ptr++ = '\n';
         *ptr = 0;
         cursor_y++;
     }
-    
+
     scpy(f->data, buf);
     f->sz = slen(buf);
     disk_sync_write();
@@ -222,9 +571,10 @@ static void execute_script(const char* filename) {
             delay(10000);
         }
         else if(starts(line, "color ")) {
-            if(line[6] == '1') TERM_BG = 0x0F00;
-            else if(line[6] == '2') TERM_BG = 0x0F00;
-            else TERM_BG = 0x0000;
+            if(line[6] == '0') TERM_FG = 0x0F00;
+            else if(line[6] == '1') TERM_FG = 0x0A00;
+            else if(line[6] == '2') TERM_FG = 0x0900;
+            else if(line[6] == '3') TERM_FG = 0x0400;
             cls(); shell_row=1;
         }
         else if(!scmp(line, "matrix")) {
@@ -268,7 +618,7 @@ static void shell_core() {
 
         if(!scmp(cmd, "help")) {
             sh_print("=== GitOS Command Reference ===", TERM_SYS);
-            sh_print("FILES : ls, cat <file>, touch <file>, rm <file>, edit <file>", TERM_FG);
+            sh_print("FILES : ls, cat <file>, touch <file>, rm <file>, edit <file>, vim <file>", TERM_FG);
             sh_print("SYSTEM: clear, color <1/2/3>, res <WxH>, reboot, shutdown", TERM_FG);
             sh_print("APPS  : sysinfo, calc <expr>, time, uptime, whoami, ascii", TERM_FG);
             sh_print("DEV   : run <file.gs> (Execute GitScript programs)", 0x0F00);
@@ -288,9 +638,10 @@ static void shell_core() {
         }
         else if(!scmp(cmd, "clear") || !scmp(cmd, "cls")) { cls(); shell_row=1; }
         else if(starts(cmd, "color ")) {
-            if(cmd[6] == '1') TERM_BG = 0x0F00;
-            else if(cmd[6] == '2') TERM_BG = 0x0F00;
-            else TERM_BG = 0x0000;
+            if(cmd[6] == '0') TERM_FG = 0x0F00;
+            else if(cmd[6] == '1') TERM_FG = 0x0A00;
+            else if(cmd[6] == '2') TERM_FG = 0x0900;
+            else if(cmd[6] == '3') TERM_FG = 0x0400;
             cls(); shell_row=1;
         }
         else if(!scmp(cmd, "reboot")) { outb(0x64, 0xFE); while(1); }
@@ -303,12 +654,17 @@ static void shell_core() {
         else if(starts(cmd, "echo ")) { sh_print(cmd+5, TERM_FG); }
         else if(starts(cmd, "calc ")) {
             char* p = cmd + 5; int n1 = atoi(p);
-            while(*p >= '0' && *p <= '9') p++; while(*p == ' ') p++;
+            while(*p == '-' || (*p >= '0' && *p <= '9')) p++; while(*p == ' ') p++;
             char op = *p; if(op) p++; while(*p == ' ') p++;
-            int n2 = atoi(p); int res = 0;
-            if(op == '+') res = n1 + n2; else if(op == '-') res = n1 - n2; else if(op == '*') res = n1 * n2;
-            char b[32]="Result: "; char n[12]; sint(n, res); scat(b, n);
-            sh_print(b, 0x0F00);
+            int n2 = atoi(p); int res = 0; int ok = 1;
+            if(op == '+') res = n1 + n2;
+            else if(op == '-') res = n1 - n2;
+            else if(op == '*') res = n1 * n2;
+            else if(op == '/') {
+                if(!n2) { sh_print("Error: division by zero", TERM_ERR); ok = 0; }
+                else res = n1 / n2;
+            }
+            if(ok) { char b[32]="Result: "; char n[12]; sint(n, res); scat(b, n); sh_print(b, 0x0F00); }
         }
         else if(!scmp(cmd, "ls")) {
             for(int i=0; i<NFILES; i++){
@@ -329,6 +685,11 @@ static void shell_core() {
             File* f=fs_find(cmd+3);
             if(f && !f->sys) { f->name[0]=0; disk_sync_write(); }
             else sh_print("rm: Permission denied or file not found", TERM_ERR);
+        }
+        else if(starts(cmd, "vim ")) {
+            File* f=fs_open(cmd+4);
+            if(f) vim_editor(f);
+            else sh_print("vim: cannot open file", TERM_ERR);
         }
         else if(starts(cmd, "edit ")) {
             File* f=fs_open(cmd+5);

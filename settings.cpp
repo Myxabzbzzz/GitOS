@@ -4,7 +4,7 @@ typedef unsigned short u16;
 typedef void(*puts_t)(int,int,const char*,u16);
 typedef void(*cls_t)(void);
 typedef void(*fill_t)(int,u16);
-typedef int (*rl_t)(char*,int,int,u16);
+typedef int (*rl_t)(char*,int,int,u16,u16);
 typedef u8  (*kbd_t)(void);
 
 #define CW 0x0F00
@@ -75,7 +75,7 @@ void run_settings(char*osname,int*timeout,int*defmode,
             if(sel==0){
                 P(10,5,"New name: ",CY);
                 char buf[32]="";
-                if(RL(buf,32,5,CY)>0)_sc(osname,buf);
+                if(RL(buf,32,5,CY,0)>0)_sc(osname,buf);
             } else if(sel==1){
                 *timeout=(*timeout%9)+1;
             } else if(sel==2){
